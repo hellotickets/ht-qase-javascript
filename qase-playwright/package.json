@@ -44,7 +44,7 @@
   "license": "Apache-2.0",
   "dependencies": {
     "chalk": "^4.1.2",
-    "qase-javascript-commons": "~2.4.1",
+    "qase-javascript-commons": "https://gitpkg.vercel.app/hellotickets/ht-qase-javascript/qase-javascript-commons?main",
     "uuid": "^9.0.0"
   },
   "peerDependencies": {
