@@ -33,7 +33,7 @@
     "lodash.merge": "^4.6.2",
     "lodash.mergewith": "^4.6.2",
     "mime-types": "^2.1.33",
-    "qase-api-client": "~1.0.1",
+    "qase-api-client": "https://gitpkg.vercel.app/hellotickets/ht-qase-javascript/qase-api-client?main",
     "qase-api-v2-client": "~1.0.1",
     "strip-ansi": "^6.0.1",
     "uuid": "^9.0.0"
