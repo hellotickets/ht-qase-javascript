@@ -114,6 +114,33 @@ describe('AttachmentService', () => {
       expect(api.uploadAttachment).toHaveBeenCalledTimes(2);
     });
 
+    it('should retry on transient network errors (ECONNRESET) then succeed', async () => {
+      const netError: any = new Error('socket hang up');
+      netError.isAxiosError = true;
+      netError.code = 'ECONNRESET';
+      // no `response` -> this is a network-level failure
+
+      api.uploadAttachment
+        .mockRejectedValueOnce(netError)
+        .mockResolvedValueOnce({ data: { result: [{ hash: 'h1' }] } });
+
+      const result = await service.uploadAttachments('PROJ', [makeAttachment()], true);
+      expect(result).toEqual(['h1']);
+      expect(api.uploadAttachment).toHaveBeenCalledTimes(2);
+    });
+
+    it('should not retry axios errors that carry an HTTP response (e.g. 500)', async () => {
+      const httpError: any = new Error('Server Error');
+      httpError.isAxiosError = true;
+      httpError.response = { status: 500, headers: {}, data: {} };
+
+      api.uploadAttachment.mockRejectedValue(httpError);
+
+      const result = await service.uploadAttachments('PROJ', [makeAttachment()], true);
+      expect(result).toEqual([]);
+      expect(api.uploadAttachment).toHaveBeenCalledTimes(1);
+    });
+
     it('should continue with next batch if current batch fails with non-429 error', async () => {
       const nonRetryableError: any = new Error('Server Error');
       nonRetryableError.isAxiosError = true;
@@ -147,6 +174,69 @@ describe('AttachmentService', () => {
     it('should return empty array when all attachments are invalid', async () => {
       const result = await service.uploadAttachments('PROJ', [makeAttachment({ size: 0, content: undefined, file_path: undefined })], true);
       expect(result).toEqual([]);
+    });
+  });
+
+  describe('uploadAttachmentsMapped', () => {
+    it('should return an empty map when upload disabled', async () => {
+      const map = await service.uploadAttachmentsMapped('PROJ', [makeAttachment()], false);
+      expect(map.size).toBe(0);
+      expect(api.uploadAttachment).not.toHaveBeenCalled();
+    });
+
+    it('should map each attachment to its hash by index within the batch', async () => {
+      const a1 = makeAttachment({ file_name: 'a1.png', size: 100 });
+      const a2 = makeAttachment({ file_name: 'a2.png', size: 100 });
+      api.uploadAttachment.mockResolvedValue({
+        data: { result: [{ hash: 'hash-a1' }, { hash: 'hash-a2' }] },
+      });
+
+      const map = await service.uploadAttachmentsMapped('PROJ', [a1, a2], true);
+
+      expect(map.get(a1)).toBe('hash-a1');
+      expect(map.get(a2)).toBe('hash-a2');
+    });
+
+    it('should skip mapping a batch when response length does not match request length', async () => {
+      const a1 = makeAttachment({ file_name: 'a1.png', size: 100 });
+      const a2 = makeAttachment({ file_name: 'a2.png', size: 100 });
+      // Only one hash returned for two files -> ambiguous, must not mis-assign.
+      api.uploadAttachment.mockResolvedValue({
+        data: { result: [{ hash: 'only-one' }] },
+      });
+
+      const map = await service.uploadAttachmentsMapped('PROJ', [a1, a2], true);
+
+      expect(map.size).toBe(0);
+      expect(logger.logError).toHaveBeenCalledWith(expect.stringContaining('response size mismatch'));
+    });
+
+    it('should split >20 attachments into multiple requests and map all of them', async () => {
+      const attachments = Array.from({ length: 25 }, (_, i) =>
+        makeAttachment({ file_name: `file${i}.png`, size: 100 }),
+      );
+      // First request: 20 files, second: 5 files. Return matching-length results.
+      api.uploadAttachment
+        .mockResolvedValueOnce({ data: { result: attachments.slice(0, 20).map((_, i) => ({ hash: `h${i}` })) } })
+        .mockResolvedValueOnce({ data: { result: attachments.slice(20).map((_, i) => ({ hash: `h${20 + i}` })) } });
+
+      const map = await service.uploadAttachmentsMapped('PROJ', attachments, true);
+
+      expect(api.uploadAttachment).toHaveBeenCalledTimes(2);
+      expect(map.size).toBe(25);
+      expect(map.get(attachments[0])).toBe('h0');
+      expect(map.get(attachments[24])).toBe('h24');
+    });
+
+    it('uploadAttachments wrapper returns the mapped hashes as an array', async () => {
+      const a1 = makeAttachment({ file_name: 'a1.png', size: 100 });
+      const a2 = makeAttachment({ file_name: 'a2.png', size: 100 });
+      api.uploadAttachment.mockResolvedValue({
+        data: { result: [{ hash: 'hash-a1' }, { hash: 'hash-a2' }] },
+      });
+
+      const result = await service.uploadAttachments('PROJ', [a1, a2], true);
+      expect(result).toEqual(['hash-a1', 'hash-a2']);
     });
   });
 });

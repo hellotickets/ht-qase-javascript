@@ -10,6 +10,7 @@ import { processError } from './api-error-handler';
 const MAX_FILE_SIZE = 32 * 1024 * 1024; // 32 MB per file
 const MAX_REQUEST_SIZE = 128 * 1024 * 1024; // 128 MB per request
 const MAX_FILES_PER_REQUEST = 20; // 20 files per request
+const RETRYABLE_NETWORK_CODES = ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ECONNABORTED', 'EPIPE'];
 
 interface AttachmentData {
   name: string;
@@ -37,11 +38,21 @@ export class AttachmentService {
     attachments: Attachment[],
     uploadEnabled: boolean,
   ): Promise<string[]> {
+    const map = await this.uploadAttachmentsMapped(projectCode, attachments, uploadEnabled);
+    return [...map.values()];
+  }
+
+  async uploadAttachmentsMapped(
+    projectCode: string,
+    attachments: Attachment[],
+    uploadEnabled: boolean,
+  ): Promise<Map<Attachment, string>> {
+    const hashByAttachment = new Map<Attachment, string>();
+
     if (!uploadEnabled) {
-      return [];
+      return hashByAttachment;
     }
 
-    const uploadedHashes: string[] = [];
     const validAttachments: Attachment[] = [];
 
     for (const attachment of attachments) {
@@ -68,7 +79,7 @@ export class AttachmentService {
     }
 
     if (validAttachments.length === 0) {
-      return uploadedHashes;
+      return hashByAttachment;
     }
 
     const initialJitter = Math.random() * 500;
@@ -90,11 +101,25 @@ export class AttachmentService {
         const batchData = batch.map(a => this.prepareAttachmentData(a));
         const response = await this.uploadWithRetry(projectCode, batchData, batchNames);
 
-        if (response.data.result) {
-          for (const result of response.data.result) {
-            if (result.hash) {
-              uploadedHashes.push(result.hash);
-            }
+        const results = response.data.result;
+        if (!results) {
+          continue;
+        }
+
+        if (results.length !== batch.length) {
+          this.logger.logError(
+            `Attachment upload response size mismatch for batch ${i + 1}: ` +
+            `expected ${batch.length} result(s), got ${results.length}. ` +
+            `Skipping hash mapping for this batch to avoid mis-assigning attachments.`,
+          );
+          continue;
+        }
+
+        for (let j = 0; j < batch.length; j++) {
+          const hash = results[j]?.hash;
+          const attachment = batch[j];
+          if (hash && attachment) {
+            hashByAttachment.set(attachment, hash);
           }
         }
       } catch (error) {
@@ -108,7 +133,7 @@ export class AttachmentService {
       }
     }
 
-    return uploadedHashes;
+    return hashByAttachment;
   }
 
   private groupIntoBatches(attachments: Attachment[]): Attachment[][] {
@@ -164,32 +189,35 @@ export class AttachmentService {
       } catch (error) {
         lastError = error;
 
-        if (isAxiosError(error)) {
-          if (error.response?.status === 429) {
-            if (attempt < maxRetries) {
-              const retryAfter = this.getRetryAfter(error);
-              const baseWaitTime = retryAfter ?? delay;
-              const jitterPercent = 0.1 + Math.random() * 0.2;
-              const jitter = baseWaitTime * jitterPercent;
-              const waitTime = Math.floor(baseWaitTime + jitter);
+        const is429 = isAxiosError(error) && error.response?.status === 429;
+        const isNetwork = this.isRetryableNetworkError(error);
 
-              this.logger.logDebug(
-                `Rate limit exceeded (429) for attachment(s) "${attachmentNames}". ` +
-                `Retrying in ${waitTime}ms (attempt ${attempt + 1}/${maxRetries})`,
-              );
-
-              await this.delay(waitTime);
-              delay = Math.min(delay * 2, 30000);
-            } else {
-              this.logger.logError(
-                `Failed to upload attachment(s) "${attachmentNames}" after ${maxRetries} retries due to rate limiting`,
-              );
-            }
-          } else {
-            throw error;
-          }
-        } else {
+        if (!is429 && !isNetwork) {
           throw error;
+        }
+
+        if (attempt < maxRetries) {
+          const retryAfter = is429 ? this.getRetryAfter(error) : null;
+          const baseWaitTime = retryAfter ?? delay;
+          const jitterPercent = 0.1 + Math.random() * 0.2;
+          const jitter = baseWaitTime * jitterPercent;
+          const waitTime = Math.floor(baseWaitTime + jitter);
+
+          const reason = is429
+            ? 'Rate limit exceeded (429)'
+            : `Network error (${(error as AxiosError).code ?? 'unknown'})`;
+          this.logger.logDebug(
+            `${reason} for attachment(s) "${attachmentNames}". ` +
+            `Retrying in ${waitTime}ms (attempt ${attempt + 1}/${maxRetries})`,
+          );
+
+          await this.delay(waitTime);
+          delay = Math.min(delay * 2, 30000);
+        } else {
+          this.logger.logError(
+            `Failed to upload attachment(s) "${attachmentNames}" after ${maxRetries} retries due to ` +
+            `${is429 ? 'rate limiting' : 'network errors'}`,
+          );
         }
       }
     }
@@ -209,6 +237,17 @@ export class AttachmentService {
       }
     }
     return null;
+  }
+
+  private isRetryableNetworkError(error: unknown): boolean {
+    if (!isAxiosError(error)) {
+      return false;
+    }
+    // A network-level failure has no HTTP response attached.
+    if (error.response) {
+      return false;
+    }
+    return typeof error.code === 'string' && RETRYABLE_NETWORK_CODES.includes(error.code);
   }
 
   private delay(ms: number): Promise<void> {
